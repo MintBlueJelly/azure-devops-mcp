@@ -3,14 +3,15 @@ name: Docker Image CI
 # An allowlist, not an ignore list: a version tag should mean the image changed, and every other
 # path here — the README, this workflow — builds a byte-identical image.
 #
-# The image's whole content is the npm package pinned in the dockerfile, so that is the only input.
-# Use the Actions "Run workflow" button to rebuild when no listed path changed — a base-image CVE,
-# say.
+# The image's whole content is the upstream release pinned in the dockerfile plus patches/, so those
+# are the only inputs. Use the Actions "Run workflow" button to rebuild when no listed path changed —
+# a base-image CVE, say.
 on:
   push:
     branches: ["main"]
     paths: &image_inputs
       - "azure-devops-mcp.dockerfile"
+      - "patches/**"
   pull_request:
     branches: ["main"]
     paths: *image_inputs
@@ -20,33 +21,59 @@ permissions:
   contents: write # create the release
   packages: write # push image to ghcr.io
 
+# The revision is counted from existing releases, so two runs at once could count the same one.
+# Only runs on main push and release (the Push and Create release steps), and they all share the
+# group of refs/heads/main. A pull request, or a manual run on another branch, builds and tests only.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      # Both outputs are computed once and reused, so nothing downstream rebuilds the reference by
-      # hand. GHCR requires a lowercase repository path, and `github.repository` preserves the
-      # owner's casing — metadata-action lowercases it silently, so an image reference assembled
-      # anywhere else has to do the same or it will not match.
-      #
-      # The dockerfile's npm pin is the only place the version lives. Deriving the tag from it is
-      # what stops the image saying one version while containing another.
-      - name: Resolve image name and version
-        id: img
-        run: |
-          echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-          version=$(sed -n 's|^RUN npm install -g @azure-devops/mcp@\([0-9][0-9.]*\)$|\1|p' azure-devops-mcp.dockerfile)
-          test -n "$version" || { echo "no @azure-devops/mcp@<version> found in the dockerfile" >&2; exit 1; }
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
+      # Before the version is resolved, which looks up existing image tags.
       - name: Log in to ghcr.io
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Both outputs are computed once and reused, so nothing downstream rebuilds the reference by
+      # hand. GHCR requires a lowercase repository path, and `github.repository` preserves the
+      # owner's casing — metadata-action lowercases it silently, so an image reference assembled
+      # anywhere else has to do the same or it will not match.
+      #
+      # The version is the dockerfile's upstream pin plus a revision: one more than the highest
+      # release of that pin so far, starting at 1, and past any revision whose image is already in
+      # the registry. Every image pushed gets a tag of its own, so no tag ever changes what it
+      # contains — a rebuild for a base-image CVE included. Nothing is pushed or released before the
+      # smoke test passes, so a failed run's revision is used again by the next one.
+      - name: Resolve image name and version
+        id: img
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          name="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          arg() { sed -n "s|^ARG $1=\(.*\)$|\1|p" azure-devops-mcp.dockerfile; }
+          tag=$(arg UPSTREAM_TAG); commit=$(arg UPSTREAM_COMMIT)
+          [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)*$ && "$commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "UPSTREAM_TAG or UPSTREAM_COMMIT missing or malformed in the dockerfile" >&2; exit 1; }
+          last=$(gh release list --limit 1000 --json tagName \
+            --jq "[.[].tagName | select(startswith(\"$tag-\")) | ltrimstr(\"$tag-\") | select(test(\"^[0-9]+\$\")) | tonumber] | max // 0")
+          revision=$((last + 1))
+          # A run that pushed and then failed to create its release left an image with no release.
+          # Skip its revision rather than overwrite that tag.
+          while docker manifest inspect "$name:${tag#v}-$revision" >/dev/null 2>&1; do
+            revision=$((revision + 1))
+          done
+          echo "version=${tag#v}-$revision" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_commit=$commit" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
         id: meta
@@ -58,40 +85,71 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ steps.img.outputs.version }}
 
-      - name: Build and push
+      # Upstream's own suite against the patched source, before anything is pushed. The image build
+      # below reuses this build's cached layers.
+      - name: Test patched upstream
         uses: docker/build-push-action@v7
         with:
           context: .
           file: azure-devops-mcp.dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          target: test
+          push: false
+
+      # Into the local image store only. The push follows the smoke test, so no tag in the registry,
+      # `latest` included, ever holds an image that failed it.
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: azure-devops-mcp.dockerfile
+          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          load: ${{ github.event_name == 'pull_request' }}
 
-      # Proves the entrypoint resolves and the binary runs. `--help` is enough: the server needs a
-      # credential for anything else, and a broken ENTRYPOINT is the failure this image can actually
-      # have — a runner that appends arguments gets a container that exits immediately, with nothing
-      # in its log to say why.
-      #
-      # On a pull request this runs against the locally loaded image; on main it pulls back what was
-      # just pushed, so it also proves the push landed.
+      # Proves the entrypoint resolves, the server listens beyond loopback, refuses a request without
+      # a bearer token, and serves its tool list. `tools/list` needs no credential that works: no
+      # Azure DevOps call is made until a tool runs.
       - name: Smoke test
-        run: docker run --rm ${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }} --help
+        run: |
+          docker run -d --name smoke -p 8080:8080 ${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }} smoke-test-org
+          trap 'code=$?; [ $code -ne 0 ] && docker logs smoke; docker rm -f smoke >/dev/null; exit $code' EXIT
+          # Until the server listens, Docker's port proxy accepts a connection and then resets it, which
+          # --retry-connrefused does not retry.
+          curl -sf -o /dev/null --retry 15 --retry-all-errors --retry-delay 1 http://127.0.0.1:8080/healthz
+          mcp() { curl -s -X POST http://127.0.0.1:8080/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$@"; }
+          anonymous=$(mcp -o /dev/null -w '%{http_code}')
+          [ "$anonymous" = 401 ] || { echo "a request without a bearer token got $anonymous, not 401" >&2; exit 1; }
+          tools=$(mcp -H 'Authorization: Bearer smoke-test' | jq '.result.tools | length')
+          [ "$tools" -gt 0 ] || { echo "tools/list returned no tools" >&2; exit 1; }
+          echo "listening, refuses anonymous requests, lists $tools tools"
 
-      # After the smoke test, so a release only ever describes an image that started. The tag is the
-      # upstream version rather than one derived from commit history, so a rebuild at an unchanged
-      # pin finds its release already there — skipping is correct, not a failure.
+      # The image the smoke test ran, not a rebuild of it.
+      - name: Push
+        if: github.ref == 'refs/heads/main'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: for tag in $TAGS; do docker push "$tag"; done
+
+      # After the smoke test, so a release only ever describes an image that started — and the
+      # releases are what the next run counts its revision from.
       - name: Create release
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="v${{ steps.img.outputs.version }}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "release $tag already exists — nothing to do"
-            exit 0
+            echo "::error::release $tag already exists, so the image just pushed overwrote a released tag"
+            exit 1
           fi
-          gh release create "$tag" \
-            --target "$GITHUB_SHA" \
-            --title "$tag" \
-            --notes "Image: \`${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }}\`"
+          upstream_tag=${{ steps.img.outputs.upstream_tag }}
+          upstream_commit=${{ steps.img.outputs.upstream_commit }}
+          {
+            echo "Image: \`${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }}\`"
+            echo
+            echo "Upstream: [microsoft/azure-devops-mcp $upstream_tag](https://github.com/microsoft/azure-devops-mcp/tree/$upstream_commit) at \`$upstream_commit\`"
+            echo
+            echo "Patches:"
+            for patch in patches/*.patch; do echo "- [\`${patch#patches/}\`](https://github.com/${{ github.repository }}/blob/$GITHUB_SHA/$patch)"; done
+          } > notes.md
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes-file notes.md
