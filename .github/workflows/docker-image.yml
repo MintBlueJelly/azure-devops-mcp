@@ -3,14 +3,15 @@ name: Docker Image CI
 # An allowlist, not an ignore list: a version tag should mean the image changed, and every other
 # path here — the README, this workflow — builds a byte-identical image.
 #
-# The image's whole content is the npm package pinned in the dockerfile, so that is the only input.
-# Use the Actions "Run workflow" button to rebuild when no listed path changed — a base-image CVE,
-# say.
+# The image's whole content is the upstream release pinned in the dockerfile plus patches/, so those
+# are the only inputs. Use the Actions "Run workflow" button to rebuild when no listed path changed —
+# a base-image CVE, say.
 on:
   push:
     branches: ["main"]
     paths: &image_inputs
       - "azure-devops-mcp.dockerfile"
+      - "patches/**"
   pull_request:
     branches: ["main"]
     paths: *image_inputs
@@ -25,21 +26,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # the revision check diffs against the base commit
 
       # Both outputs are computed once and reused, so nothing downstream rebuilds the reference by
       # hand. GHCR requires a lowercase repository path, and `github.repository` preserves the
       # owner's casing — metadata-action lowercases it silently, so an image reference assembled
       # anywhere else has to do the same or it will not match.
       #
-      # The dockerfile's npm pin is the only place the version lives. Deriving the tag from it is
+      # The dockerfile's ARGs are the only place the version lives. Deriving the tag from them is
       # what stops the image saying one version while containing another.
       - name: Resolve image name and version
         id: img
         run: |
           echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-          version=$(sed -n 's|^RUN npm install -g @azure-devops/mcp@\([0-9][0-9.]*\)$|\1|p' azure-devops-mcp.dockerfile)
-          test -n "$version" || { echo "no @azure-devops/mcp@<version> found in the dockerfile" >&2; exit 1; }
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          arg() { sed -n "s|^ARG $1=\(.*\)$|\1|p" azure-devops-mcp.dockerfile; }
+          tag=$(arg UPSTREAM_TAG); commit=$(arg UPSTREAM_COMMIT); revision=$(arg PATCH_REVISION)
+          [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)*$ && "$commit" =~ ^[0-9a-f]{40}$ && "$revision" =~ ^[0-9]+$ ]] || {
+            echo "UPSTREAM_TAG, UPSTREAM_COMMIT or PATCH_REVISION missing or malformed in the dockerfile" >&2; exit 1; }
+          echo "version=${tag#v}-$revision" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_commit=$commit" >> "$GITHUB_OUTPUT"
+
+      # A changed patch under an unchanged version would push different code to a tag that already
+      # exists, and whatever pins that tag would never notice.
+      - name: A changed patch bumps the version
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          base=${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          if [[ "$base" =~ ^0+$ ]]; then exit 0; fi # a push with no previous commit has nothing to compare
+          if git diff --quiet "$base" HEAD -- patches/; then exit 0; fi
+          if git diff "$base" HEAD -- azure-devops-mcp.dockerfile | grep -qE '^\+ARG (UPSTREAM_TAG|PATCH_REVISION)='; then exit 0; fi
+          echo "::error::patches/ changed, but neither UPSTREAM_TAG nor PATCH_REVISION did — bump PATCH_REVISION"
+          exit 1
 
       - name: Log in to ghcr.io
         uses: docker/login-action@v4
@@ -58,6 +77,16 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ steps.img.outputs.version }}
 
+      # Upstream's own suite against the patched source, before anything is pushed. The image build
+      # below reuses this build's cached layers.
+      - name: Test patched upstream
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: azure-devops-mcp.dockerfile
+          target: test
+          push: false
+
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
@@ -68,19 +97,27 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           load: ${{ github.event_name == 'pull_request' }}
 
-      # Proves the entrypoint resolves and the binary runs. `--help` is enough: the server needs a
-      # credential for anything else, and a broken ENTRYPOINT is the failure this image can actually
-      # have — a runner that appends arguments gets a container that exits immediately, with nothing
-      # in its log to say why.
+      # Proves the entrypoint resolves, the server listens beyond loopback, refuses a request without
+      # a bearer token, and serves its tool list. `tools/list` needs no credential that works: no
+      # Azure DevOps call is made until a tool runs.
       #
       # On a pull request this runs against the locally loaded image; on main it pulls back what was
       # just pushed, so it also proves the push landed.
       - name: Smoke test
-        run: docker run --rm ${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }} --help
+        run: |
+          docker run -d --name smoke -p 8080:8080 ${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }} smoke-test-org
+          trap 'code=$?; [ $code -ne 0 ] && docker logs smoke; docker rm -f smoke >/dev/null; exit $code' EXIT
+          curl -sf -o /dev/null --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/healthz
+          mcp() { curl -s -X POST http://127.0.0.1:8080/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$@"; }
+          anonymous=$(mcp -o /dev/null -w '%{http_code}')
+          [ "$anonymous" = 401 ] || { echo "a request without a bearer token got $anonymous, not 401" >&2; exit 1; }
+          tools=$(mcp -H 'Authorization: Bearer smoke-test' | jq '.result.tools | length')
+          [ "$tools" -gt 0 ] || { echo "tools/list returned no tools" >&2; exit 1; }
+          echo "listening, refuses anonymous requests, lists $tools tools"
 
       # After the smoke test, so a release only ever describes an image that started. The tag is the
-      # upstream version rather than one derived from commit history, so a rebuild at an unchanged
-      # pin finds its release already there — skipping is correct, not a failure.
+      # version from the dockerfile rather than one derived from commit history, so a rebuild at an
+      # unchanged pin finds its release already there — skipping is correct, not a failure.
       - name: Create release
         if: github.event_name != 'pull_request'
         env:
@@ -91,7 +128,14 @@ jobs:
             echo "release $tag already exists — nothing to do"
             exit 0
           fi
-          gh release create "$tag" \
-            --target "$GITHUB_SHA" \
-            --title "$tag" \
-            --notes "Image: \`${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }}\`"
+          upstream_tag=${{ steps.img.outputs.upstream_tag }}
+          upstream_commit=${{ steps.img.outputs.upstream_commit }}
+          {
+            echo "Image: \`${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }}\`"
+            echo
+            echo "Upstream: [microsoft/azure-devops-mcp $upstream_tag](https://github.com/microsoft/azure-devops-mcp/tree/$upstream_commit) at \`$upstream_commit\`"
+            echo
+            echo "Patches:"
+            for patch in patches/*.patch; do echo "- [\`${patch#patches/}\`](https://github.com/${{ github.repository }}/blob/$GITHUB_SHA/$patch)"; done
+          } > notes.md
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes-file notes.md
