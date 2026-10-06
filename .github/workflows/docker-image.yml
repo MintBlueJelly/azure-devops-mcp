@@ -39,8 +39,9 @@ jobs:
       #
       # The version is the dockerfile's upstream pin plus a revision: one more than the highest
       # release of that pin so far, starting at 1. Every image pushed gets a tag of its own, so no
-      # tag ever changes what it contains — a rebuild for a base-image CVE included. A release only
-      # follows a passing smoke test, so a failed run's revision is used again by the next one.
+      # tag ever changes what it contains — a rebuild for a base-image CVE included. Nothing is pushed
+      # or released before the smoke test passes, so a failed run's revision is used again by the
+      # next one.
       - name: Resolve image name and version
         id: img
         env:
@@ -84,22 +85,20 @@ jobs:
           target: test
           push: false
 
-      - name: Build and push
+      # Into the local image store only. The push follows the smoke test, so no tag in the registry,
+      # `latest` included, ever holds an image that failed it.
+      - name: Build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: azure-devops-mcp.dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          load: ${{ github.event_name == 'pull_request' }}
 
       # Proves the entrypoint resolves, the server listens beyond loopback, refuses a request without
       # a bearer token, and serves its tool list. `tools/list` needs no credential that works: no
       # Azure DevOps call is made until a tool runs.
-      #
-      # On a pull request this runs against the locally loaded image; on main it pulls back what was
-      # just pushed, so it also proves the push landed.
       - name: Smoke test
         run: |
           docker run -d --name smoke -p 8080:8080 ${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }} smoke-test-org
@@ -113,6 +112,13 @@ jobs:
           tools=$(mcp -H 'Authorization: Bearer smoke-test' | jq '.result.tools | length')
           [ "$tools" -gt 0 ] || { echo "tools/list returned no tools" >&2; exit 1; }
           echo "listening, refuses anonymous requests, lists $tools tools"
+
+      # The image the smoke test ran, not a rebuild of it.
+      - name: Push
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: for tag in $TAGS; do docker push "$tag"; done
 
       # After the smoke test, so a release only ever describes an image that started — and the
       # releases are what the next run counts its revision from.

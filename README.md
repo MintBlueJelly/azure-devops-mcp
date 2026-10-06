@@ -71,9 +71,10 @@ what it contains**, a rebuild for a base-image CVE included: that rebuild gets t
 pin the full tag, and move the pin to pick a rebuild up. Run the workflow by hand to rebuild with
 nothing changed.
 
-The release is created only after the smoke test passes, and the releases are what the next run
-counts from. A run that fails after pushing therefore leaves no release, and its revision is used
-again by the next run. Runs never overlap, so two of them cannot count the same revision.
+Nothing is pushed until the smoke test has passed against the image just built, and the release
+follows the push. The releases are what the next run counts from, so a run that fails publishes
+nothing and its revision is used again by the next run. Runs never overlap, so two of them cannot
+count the same revision.
 
 The build fails if `UPSTREAM_TAG` no longer points at `UPSTREAM_COMMIT`, if a patch does not apply,
 or if upstream's test suite fails against the patched source. That suite runs in the dockerfile's
