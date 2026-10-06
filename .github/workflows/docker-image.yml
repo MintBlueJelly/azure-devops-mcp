@@ -21,44 +21,41 @@ permissions:
   contents: write # create the release
   packages: write # push image to ghcr.io
 
+# The revision is counted from existing releases, so two runs at once could count the same one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0 # the revision check diffs against the base commit
 
       # Both outputs are computed once and reused, so nothing downstream rebuilds the reference by
       # hand. GHCR requires a lowercase repository path, and `github.repository` preserves the
       # owner's casing — metadata-action lowercases it silently, so an image reference assembled
       # anywhere else has to do the same or it will not match.
       #
-      # The dockerfile's ARGs are the only place the version lives. Deriving the tag from them is
-      # what stops the image saying one version while containing another.
+      # The version is the dockerfile's upstream pin plus a revision: one more than the highest
+      # release of that pin so far, starting at 1. Every image pushed gets a tag of its own, so no
+      # tag ever changes what it contains — a rebuild for a base-image CVE included. A release only
+      # follows a passing smoke test, so a failed run's revision is used again by the next one.
       - name: Resolve image name and version
         id: img
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
           arg() { sed -n "s|^ARG $1=\(.*\)$|\1|p" azure-devops-mcp.dockerfile; }
-          tag=$(arg UPSTREAM_TAG); commit=$(arg UPSTREAM_COMMIT); revision=$(arg PATCH_REVISION)
-          [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)*$ && "$commit" =~ ^[0-9a-f]{40}$ && "$revision" =~ ^[0-9]+$ ]] || {
-            echo "UPSTREAM_TAG, UPSTREAM_COMMIT or PATCH_REVISION missing or malformed in the dockerfile" >&2; exit 1; }
-          echo "version=${tag#v}-$revision" >> "$GITHUB_OUTPUT"
+          tag=$(arg UPSTREAM_TAG); commit=$(arg UPSTREAM_COMMIT)
+          [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)*$ && "$commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "UPSTREAM_TAG or UPSTREAM_COMMIT missing or malformed in the dockerfile" >&2; exit 1; }
+          last=$(gh release list --limit 1000 --json tagName \
+            --jq "[.[].tagName | select(startswith(\"$tag-\")) | ltrimstr(\"$tag-\") | select(test(\"^[0-9]+\$\")) | tonumber] | max // 0")
+          echo "version=${tag#v}-$((last + 1))" >> "$GITHUB_OUTPUT"
           echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
           echo "upstream_commit=$commit" >> "$GITHUB_OUTPUT"
-
-      # A changed patch under an unchanged version would push different code to a tag that already
-      # exists, and whatever pins that tag would never notice.
-      - name: A changed patch bumps the version
-        if: github.event_name != 'workflow_dispatch'
-        run: |
-          base=${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-          if [[ "$base" =~ ^0+$ ]]; then exit 0; fi # a push with no previous commit has nothing to compare
-          if git diff --quiet "$base" HEAD -- patches/; then exit 0; fi
-          if git diff "$base" HEAD -- azure-devops-mcp.dockerfile | grep -qE '^\+ARG (UPSTREAM_TAG|PATCH_REVISION)='; then exit 0; fi
-          echo "::error::patches/ changed, but neither UPSTREAM_TAG nor PATCH_REVISION did — bump PATCH_REVISION"
-          exit 1
 
       - name: Log in to ghcr.io
         uses: docker/login-action@v4
@@ -115,9 +112,8 @@ jobs:
           [ "$tools" -gt 0 ] || { echo "tools/list returned no tools" >&2; exit 1; }
           echo "listening, refuses anonymous requests, lists $tools tools"
 
-      # After the smoke test, so a release only ever describes an image that started. The tag is the
-      # version from the dockerfile rather than one derived from commit history, so a rebuild at an
-      # unchanged pin finds its release already there — skipping is correct, not a failure.
+      # After the smoke test, so a release only ever describes an image that started — and the
+      # releases are what the next run counts its revision from.
       - name: Create release
         if: github.event_name != 'pull_request'
         env:
@@ -125,8 +121,8 @@ jobs:
         run: |
           tag="v${{ steps.img.outputs.version }}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "release $tag already exists — nothing to do"
-            exit 0
+            echo "::error::release $tag already exists, so the image just pushed overwrote a released tag"
+            exit 1
           fi
           upstream_tag=${{ steps.img.outputs.upstream_tag }}
           upstream_commit=${{ steps.img.outputs.upstream_commit }}

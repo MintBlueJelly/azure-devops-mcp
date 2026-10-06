@@ -15,7 +15,7 @@ them.
 
 | Path | What it is |
 | --- | --- |
-| `azure-devops-mcp.dockerfile` | The pins (`UPSTREAM_TAG`, `UPSTREAM_COMMIT`, `PATCH_REVISION`) and the build |
+| `azure-devops-mcp.dockerfile` | The upstream pins (`UPSTREAM_TAG`, `UPSTREAM_COMMIT`) and the build |
 | `patches/` | `git format-patch` output, applied in name order to the pinned commit |
 | `.github/workflows/docker-image.yml` | Tests, builds, smoke-tests and releases the image |
 
@@ -50,17 +50,20 @@ Arguments after the image name are the server's: the organization, then upstream
 
 ## Releasing
 
-**The three `ARG`s at the top of `azure-devops-mcp.dockerfile` are the release.** The workflow reads
-the version back out of that file as `<upstream version>-<PATCH_REVISION>`, so the two can never
-disagree. Push, and the image appears as `:2.10.0-1`, `:latest` and `:<sha>`, with a matching
-`v2.10.0-1` GitHub release that names the upstream commit and links each patch.
+**Every push to `main` that touches the dockerfile or `patches/` is a release, and so is every manual
+run.** The image is tagged `<upstream version>-<revision>`. The upstream version comes from
+`UPSTREAM_TAG`. The workflow counts the revision itself: one more than the highest existing release
+of that upstream version, starting again at 1 when `UPSTREAM_TAG` moves. Nothing is bumped by hand.
 
-**Changing a patch means bumping `PATCH_REVISION`.** Otherwise different code would be pushed to a
-tag that already exists, and whatever pins that tag would never notice. The workflow refuses a change
-under `patches/` that leaves both `UPSTREAM_TAG` and `PATCH_REVISION` alone.
+Each run pushes `:2.10.0-<revision>`, `:latest` and `:<sha>`, with a matching `v2.10.0-<revision>`
+GitHub release that names the upstream commit and links each patch. **A revision tag never changes
+what it contains**, a rebuild for a base-image CVE included: that rebuild gets the next revision, so
+pin the full tag, and move the pin to pick a rebuild up. Run the workflow by hand to rebuild with
+nothing changed.
 
-A rebuild with nothing changed finds its release already present and skips it. Run the workflow by
-hand to rebuild for a base-image CVE.
+The release is created only after the smoke test passes, and the releases are what the next run
+counts from. A run that fails after pushing therefore leaves no release, and its revision is used
+again by the next run. Runs never overlap, so two of them cannot count the same revision.
 
 The build fails if `UPSTREAM_TAG` no longer points at `UPSTREAM_COMMIT`, if a patch does not apply,
 or if upstream's test suite fails against the patched source. That suite runs in the dockerfile's
@@ -78,7 +81,7 @@ npm ci --ignore-scripts && npm rebuild keytar && npm run build && npm test
 rm ../patches/*.patch && git format-patch "$tag" --zero-commit --no-signature -o ../patches
 ```
 
-Then set `UPSTREAM_TAG` and `UPSTREAM_COMMIT`, and reset `PATCH_REVISION` to `1`.
+Then set `UPSTREAM_TAG` and `UPSTREAM_COMMIT`. The revision starts again at 1 by itself.
 
 `--zero-commit` and `--no-signature` keep the regenerated files free of a fresh commit hash and the
 local git version, so the pull request's diff of `patches/` shows only what actually changed. Each

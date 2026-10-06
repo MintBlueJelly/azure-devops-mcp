@@ -3,12 +3,11 @@
 # Microsoft's Azure DevOps MCP server, built from source at a pinned upstream release with the
 # patches in patches/ applied. Nothing else differs from upstream.
 #
-# These three ARGs are the release: the workflow reads the image tag back out of this file, as
-# <UPSTREAM_TAG without the v>-<PATCH_REVISION>. UPSTREAM_COMMIT is what the tag pointed at when it
-# was reviewed, because a tag can move. PATCH_REVISION goes back to 1 whenever UPSTREAM_TAG moves.
+# These two ARGs pin upstream. The workflow reads them back out of this file and tags the image
+# <UPSTREAM_TAG without the v>-<revision>, counting the revision itself. UPSTREAM_COMMIT is what the
+# tag pointed at when it was reviewed, because a tag can move.
 ARG UPSTREAM_TAG=v2.10.0
 ARG UPSTREAM_COMMIT=43a2b179b02d912399be612e0f7b5121a55eb692
-ARG PATCH_REVISION=1
 
 FROM docker.io/node:24-alpine3.24 AS build
 ARG UPSTREAM_TAG
@@ -41,10 +40,8 @@ RUN npm prune --omit=dev --ignore-scripts --no-audit --no-fund
 FROM docker.io/node:24-alpine3.24
 ARG UPSTREAM_TAG
 ARG UPSTREAM_COMMIT
-ARG PATCH_REVISION
 LABEL io.github.mintbluejelly.upstream.tag="$UPSTREAM_TAG" \
-      io.github.mintbluejelly.upstream.commit="$UPSTREAM_COMMIT" \
-      io.github.mintbluejelly.patch-revision="$PATCH_REVISION"
+      io.github.mintbluejelly.upstream.commit="$UPSTREAM_COMMIT"
 WORKDIR /app
 COPY --from=prune /src/package.json ./
 COPY --from=prune /src/node_modules ./node_modules/
