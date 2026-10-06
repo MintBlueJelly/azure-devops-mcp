@@ -19,7 +19,7 @@ them.
 | `patches/` | `git format-patch` output, applied in name order to the pinned commit |
 | `.github/workflows/docker-image.yml` | Tests, builds, smoke-tests and releases the image |
 
-## What the patch adds
+## What the patches add
 
 `0001` adds a second entry point, `dist/http.js`, which serves MCP over stateless Streamable HTTP and
 **acts as the caller whose bearer token each request carries.** The server holds no credential of its
@@ -28,6 +28,11 @@ access token for Azure DevOps (resource `499b84ac-1321-427f-aa17-267ca6975798`).
 fresh server whose tools use that token and nothing else. A request without one gets `401` before
 any tool runs. It is meant to sit behind a gateway that signs each caller in and passes their token
 on.
+
+`0002` turns a rejected token into an error. Without it, Azure DevOps answers an invalid, expired or
+wrong-audience token with a redirect to its sign-in page, which some tools return as their result.
+With it, every tool reports `401`. A token for Microsoft's hosted endpoint
+(`https://mcp.dev.azure.com`) has the wrong audience and is rejected the same way.
 
 The tools themselves are upstream's, unchanged, and call the Azure DevOps REST API directly.
 
@@ -83,13 +88,14 @@ git clone --branch "$tag" https://github.com/microsoft/azure-devops-mcp.git upst
 git switch -c patched
 git am -3 ../patches/*.patch                      # on a conflict: resolve, git add, git am --continue
 npm ci --ignore-scripts && npm rebuild keytar && npm run build && npm test
-rm ../patches/*.patch && git format-patch "$tag" --zero-commit --no-signature -o ../patches
+rm ../patches/*.patch && git format-patch "$tag" --zero-commit --no-signature --no-numbered -o ../patches
 ```
 
 Then set `UPSTREAM_TAG` and `UPSTREAM_COMMIT`. The revision starts again at 1 by itself.
 
-`--zero-commit` and `--no-signature` keep the regenerated files free of a fresh commit hash and the
-local git version, so the pull request's diff of `patches/` shows only what actually changed. Each
+`--zero-commit`, `--no-signature` and `--no-numbered` keep the regenerated files free of a fresh
+commit hash, the local git version and a `[PATCH n/m]` count that changes whenever a patch is added,
+so the pull request's diff of `patches/` shows only what actually changed. Each
 patch's commit message says why it exists. Drop a patch, or the part of one, once upstream ships the
 same change: `0001`'s `jest.config.cjs` hunk is already on upstream `main`.
 
