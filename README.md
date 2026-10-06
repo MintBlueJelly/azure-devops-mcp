@@ -61,21 +61,22 @@ An unknown domain stops the server, where upstream would enable every domain, wr
 ## Releasing
 
 **Every push to `main` that touches the dockerfile or `patches/` is a release, and so is every manual
-run.** The image is tagged `<upstream version>-<revision>`. The upstream version comes from
+run on `main`.** A pull request, or a manual run on another branch, builds and tests the image and
+publishes nothing. The image is tagged `<upstream version>-<revision>`. The upstream version comes from
 `UPSTREAM_TAG`. The workflow counts the revision itself: one more than the highest existing release
 of that upstream version, starting again at 1 when `UPSTREAM_TAG` moves. Nothing is bumped by hand.
 
-Each run pushes `:2.10.0-<revision>`, `:latest` and `:<sha>`, with a matching `v2.10.0-<revision>`
+Each release pushes `:2.10.0-<revision>`, `:latest` and `:<sha>`, with a matching `v2.10.0-<revision>`
 GitHub release that names the upstream commit and links each patch. **A revision tag never changes
 what it contains**, a rebuild for a base-image CVE included: that rebuild gets the next revision, so
-pin the full tag, and move the pin to pick a rebuild up. Run the workflow by hand to rebuild with
-nothing changed.
+pin the full tag, and move the pin to pick a rebuild up. Run the workflow by hand on `main` to
+rebuild with nothing changed.
 
 Nothing is pushed until the smoke test has passed against the image just built, and the release
 follows the push. The releases are what the next run counts from, so a run that fails publishes
 nothing and its revision is used again by the next run. A run that pushed but could not create its
 release leaves an image without one, and the next run skips that revision rather than overwrite its
-tag. Runs never overlap, so two of them cannot count the same revision.
+tag. Runs on `main` never overlap, so two of them cannot count the same revision.
 
 The build fails if `UPSTREAM_TAG` no longer points at `UPSTREAM_COMMIT`, if a patch does not apply,
 or if upstream's test suite fails against the patched source. That suite runs in the dockerfile's

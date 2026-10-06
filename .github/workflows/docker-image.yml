@@ -22,6 +22,8 @@ permissions:
   packages: write # push image to ghcr.io
 
 # The revision is counted from existing releases, so two runs at once could count the same one.
+# Only runs on main push and release (the Push and Create release steps), and they all share the
+# group of refs/heads/main. A pull request, or a manual run on another branch, builds and tests only.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -123,7 +125,7 @@ jobs:
 
       # The image the smoke test ran, not a rebuild of it.
       - name: Push
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main'
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: for tag in $TAGS; do docker push "$tag"; done
@@ -131,7 +133,7 @@ jobs:
       # After the smoke test, so a release only ever describes an image that started — and the
       # releases are what the next run counts its revision from.
       - name: Create release
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
