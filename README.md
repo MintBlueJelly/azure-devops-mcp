@@ -40,10 +40,15 @@ curl -s http://127.0.0.1:8080/mcp -H "Authorization: Bearer $token" -H 'Content-
 ```
 
 Arguments after the image name are the server's: the organization, then upstream's `--domains`, and
-`--port` (default `8080`) or `--path` (default `/mcp`). `GET /healthz` answers without a token.
+`--port` (default `8080`) or `--path` (default `/mcp`). An option given twice takes its last value.
+An unknown domain stops the server, where upstream would enable every domain, write tools included.
+`GET /healthz` answers without a token.
 
 - **Stateless.** No session is issued, so a tool that would ask the user for a missing project or
   team fails instead.
+- **Request bodies up to 4 MiB.** A larger one gets `413` before it is buffered.
+- **Shutdown waits for requests in flight.** On `SIGTERM` the server stops listening, lets running
+  requests finish and closes each open connection after its response.
 - **The image runs the HTTP entry point only.** Upstream's stdio server (`dist/index.js`) is built
   but not supported here: its interactive and `azcli` authentication need `keytar`, which this image
   does not install. Images up to `2.9.0` ran the stdio server.
@@ -93,7 +98,8 @@ same change: `0001`'s `jest.config.cjs` hunk is already on upstream `main`.
 The image declares an `ENTRYPOINT` so that a runner supplying arguments **appends** to it. Against a
 `CMD`-only image those arguments replace the command instead, and the container dies with
 `exec: … not found`. The entrypoint also carries `--host 0.0.0.0`, because the server's own default,
-loopback, cannot be reached from outside the container, so do not pass `--host` again.
+loopback, cannot be reached from outside the container. A `--host` passed after the image name
+replaces it.
 
 The workflow's smoke test starts the image with only an organization and checks that it is reachable,
 refuses a request without a token and lists its tools. A broken entrypoint otherwise surfaces as a

@@ -11,6 +11,18 @@ gets a fresh McpServer whose token and connection providers return that
 token only, so one caller's token is never used for another's tool call.
 Requests without a bearer token get 401 before any tool runs.
 
+A body over 4 MiB gets 413. The SDK would otherwise buffer a body of any
+size, and any bearer string passes the check above.
+
+On SIGTERM the server stops listening and closes connections as they go
+idle. A connection that is still open, such as a gateway's pooled one,
+gets Connection: close on its next response. Without that it keeps taking
+requests, and the process never exits.
+
+An option given twice takes its last value, because a container runner's
+arguments follow the image's own. An unknown domain stops the server,
+where upstream would enable every domain, write tools included.
+
 orgName moves from index.ts to organization.ts, because importing index.ts
 starts the stdio server; the stdio entry point is otherwise unchanged.
 
@@ -24,18 +36,18 @@ index.js rule rewrites the SDK's own ./index.js to a file that does not exist.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  eslint.config.mjs                   |   2 +-
- jest.config.cjs                     |   9 +--
+ jest.config.cjs                     |   9 +-
  package.json                        |   3 +-
- src/http-server.ts                  | 114 ++++++++++++++++++++++++++
- src/http.ts                         |  74 +++++++++++++++++
+ src/http-server.ts                  | 165 ++++++++++++++++++++++++
+ src/http.ts                         |  98 ++++++++++++++
  src/index.ts                        |   2 +
- src/organization.ts                 |  12 +++
+ src/organization.ts                 |  12 ++
  src/tools/repositories.ts           |   2 +-
  src/tools/search.ts                 |   2 +-
- test/src/http-server.test.ts        | 120 ++++++++++++++++++++++++++++
+ test/src/http-server.test.ts        | 190 ++++++++++++++++++++++++++++
  test/src/tools/repositories.test.ts |   2 +-
  test/src/tools/search.test.ts       |   2 +-
- 12 files changed, 330 insertions(+), 14 deletions(-)
+ 12 files changed, 475 insertions(+), 14 deletions(-)
  create mode 100644 src/http-server.ts
  create mode 100644 src/http.ts
  create mode 100644 src/organization.ts
@@ -89,10 +101,10 @@ index 39b745f..2d34df1 100644
      "dist"
 diff --git a/src/http-server.ts b/src/http-server.ts
 new file mode 100644
-index 0000000..86135c3
+index 0000000..999ce8b
 --- /dev/null
 +++ b/src/http-server.ts
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,165 @@
 +// Copyright (c) Microsoft Corporation.
 +// Licensed under the MIT License.
 +
@@ -112,6 +124,10 @@ index 0000000..86135c3
 +  path?: string;
 +}
 +
++// MCP requests are small JSON-RPC messages. The SDK would buffer a body of any size, so this bounds what one request
++// can make the server hold in memory.
++const maxRequestBodyBytes = 4 * 1024 * 1024;
++
 +/**
 + * Creates a stateless Streamable HTTP server for running behind a gateway that authenticates each caller.
 + *
@@ -124,7 +140,12 @@ index 0000000..86135c3
 +  const orgUrl = "https://dev.azure.com/" + options.organization;
 +  const mcpPath = options.path ?? "/mcp";
 +
-+  return createServer((req, res) => {
++  const server = createServer((req, res) => {
++    // close() stops new connections but keeps serving the ones still open, such as a gateway's pooled connection.
++    // Closing each of those after its response lets shutdown finish.
++    if (!server.listening) {
++      res.setHeader("Connection", "close");
++    }
 +    handleRequest(req, res, orgUrl, mcpPath, options.enabledDomains).catch((error) => {
 +      logger.error("Failed to handle HTTP request:", error);
 +      if (!res.headersSent) {
@@ -132,6 +153,7 @@ index 0000000..86135c3
 +      }
 +    });
 +  });
++  return server;
 +}
 +
 +async function handleRequest(req: IncomingMessage, res: ServerResponse, orgUrl: string, mcpPath: string, enabledDomains: Set<string>): Promise<void> {
@@ -161,6 +183,22 @@ index 0000000..86135c3
 +    return;
 +  }
 +
++  const body = await readBody(req, maxRequestBodyBytes);
++  if (body === undefined) {
++    // The rest of the body is never read, so the connection cannot carry another request.
++    res.setHeader("Connection", "close");
++    sendJsonRpcError(res, 413, -32000, "Request body too large");
++    return;
++  }
++
++  let message: unknown;
++  try {
++    message = JSON.parse(body.toString("utf8"));
++  } catch {
++    sendJsonRpcError(res, 400, -32700, "Parse error: Invalid JSON");
++    return;
++  }
++
 +  const server = createMcpServer(orgUrl, accessToken, enabledDomains);
 +  // JSON responses: a stateless server cannot send requests back to the client, so there is nothing to stream.
 +  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
@@ -170,7 +208,32 @@ index 0000000..86135c3
 +  });
 +
 +  await server.connect(transport);
-+  await transport.handleRequest(req, res);
++  await transport.handleRequest(req, res, message);
++}
++
++/**
++ * Reads the request body, or resolves to undefined as soon as it is known to exceed the limit.
++ */
++function readBody(req: IncomingMessage, limit: number): Promise<Buffer | undefined> {
++  return new Promise((resolve, reject) => {
++    if (Number(req.headers["content-length"]) > limit) {
++      resolve(undefined);
++      return;
++    }
++    const chunks: Buffer[] = [];
++    let size = 0;
++    req.on("data", (chunk: Buffer) => {
++      size += chunk.length;
++      if (size > limit) {
++        req.pause();
++        resolve(undefined);
++      } else {
++        chunks.push(chunk);
++      }
++    });
++    req.on("end", () => resolve(Buffer.concat(chunks)));
++    req.on("error", reject);
++  });
 +}
 +
 +function createMcpServer(orgUrl: string, accessToken: string, enabledDomains: Set<string>): McpServer {
@@ -209,10 +272,10 @@ index 0000000..86135c3
 +export { createHttpServer, HttpServerOptions };
 diff --git a/src/http.ts b/src/http.ts
 new file mode 100644
-index 0000000..ee5f07e
+index 0000000..8a5bcbe
 --- /dev/null
 +++ b/src/http.ts
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,98 @@
 +#!/usr/bin/env node
 +
 +// Copyright (c) Microsoft Corporation.
@@ -223,9 +286,15 @@ index 0000000..ee5f07e
 +import { createHttpServer } from "./http-server.js";
 +import { logger } from "./logger.js";
 +import { setOrgName } from "./organization.js";
-+import { DomainsManager } from "./shared/domains.js";
++import { ALL_DOMAINS, Domain, DomainsManager } from "./shared/domains.js";
 +import { getCliArgs } from "./utils.js";
 +import { packageVersion } from "./version.js";
++
++// A container runner's arguments follow the image's own, so an option given twice takes its last value instead of
++// becoming an array.
++function lastValue<T>(value: T | T[]): T {
++  return Array.isArray(value) ? value[value.length - 1] : value;
++}
 +
 +const argv = yargs(getCliArgs())
 +  .scriptName("mcp-server-azuredevops-http")
@@ -249,17 +318,32 @@ index 0000000..ee5f07e
 +    describe: "Address to listen on",
 +    type: "string",
 +    default: "127.0.0.1",
++    coerce: (host: string | string[]) => lastValue(host),
 +  })
 +  .option("port", {
 +    alias: "p",
 +    describe: "Port to listen on",
 +    type: "number",
 +    default: 8080,
++    coerce: (port: number | number[]) => lastValue(port),
 +  })
 +  .option("path", {
 +    describe: "Path of the MCP endpoint",
 +    type: "string",
 +    default: "/mcp",
++    coerce: (path: string | string[]) => {
++      const value = lastValue(path);
++      return value.startsWith("/") ? value : `/${value}`;
++    },
++  })
++  // Upstream enables every domain, write tools included, when one is misspelled. Refuse to start instead.
++  .check(({ domains }) => {
++    const known = new Set<string>([ALL_DOMAINS, ...Object.values(Domain)]);
++    const unknown = [domains].flat().filter((domain) => !known.has(String(domain).trim().toLowerCase()));
++    if (unknown.length > 0) {
++      throw new Error(`Unknown domain(s): ${unknown.join(", ")}. Available: ${Object.values(Domain).join(", ")}`);
++    }
++    return true;
 +  })
 +  .help()
 +  .parseSync();
@@ -285,6 +369,9 @@ index 0000000..ee5f07e
 +  process.on(signal, () => {
 +    logger.info(`Received ${signal}, closing HTTP server`);
 +    server.close(() => process.exit(0));
++    // close() closes only the connections that are idle right now. Close the others as their requests finish; the
++    // server answers any further request on them with Connection: close.
++    setInterval(() => server.closeIdleConnections(), 100).unref();
 +  });
 +}
 diff --git a/src/index.ts b/src/index.ts
@@ -353,14 +440,14 @@ index fce0a07..99e648f 100644
  const SEARCH_TOOLS = {
 diff --git a/test/src/http-server.test.ts b/test/src/http-server.test.ts
 new file mode 100644
-index 0000000..8ea5c8a
+index 0000000..8cd4217
 --- /dev/null
 +++ b/test/src/http-server.test.ts
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,190 @@
 +// Copyright (c) Microsoft Corporation.
 +// Licensed under the MIT License.
 +
-+import { Server } from "http";
++import { Agent, ClientRequest, OutgoingHttpHeaders, request, Server } from "http";
 +import { AddressInfo } from "net";
 +import { createHttpServer } from "../../src/http-server";
 +import { setOrgName } from "../../src/organization";
@@ -475,6 +562,76 @@ index 0000000..8ea5c8a
 +      }
 +    });
 +    expect([...searchAuthorizations].sort()).toEqual(tokens.map((token) => `Bearer ${token}`).sort());
++  });
++
++  // Sends a request with Node's own client, which can hold a body open or reuse one connection.
++  function postRaw(url: string, headers: OutgoingHttpHeaders, send: (req: ClientRequest) => void, agent?: Agent): Promise<{ status?: number; connection?: string; body: string }> {
++    return new Promise((resolve, reject) => {
++      const req = request(
++        url,
++        { method: "POST", agent, headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Authorization": "Bearer token-a", ...headers } },
++        (res) => {
++          let body = "";
++          res.setEncoding("utf8");
++          res.on("data", (chunk) => (body += chunk));
++          res.on("end", () => resolve({ status: res.statusCode, connection: res.headers.connection, body }));
++        }
++      );
++      req.on("error", reject);
++      send(req);
++    });
++  }
++
++  it("refuses a body over 4 MiB, whether declared or streamed, and closes the connection", async () => {
++    const declared = await postRaw(`${baseUrl}/mcp`, { "Content-Length": 4 * 1024 * 1024 + 1 }, (req) => req.flushHeaders());
++    const streamed = await postRaw(`${baseUrl}/mcp`, { "Transfer-Encoding": "chunked" }, (req) => req.write(Buffer.alloc(4 * 1024 * 1024 + 1, "a")));
++
++    for (const response of [declared, streamed]) {
++      expect(response.status).toBe(413);
++      expect(response.connection).toBe("close");
++      expect(JSON.parse(response.body).error.message).toBe("Request body too large");
++    }
++  });
++
++  it("rejects a body that is not JSON", async () => {
++    const response = await realFetch(`${baseUrl}/mcp`, {
++      method: "POST",
++      headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Authorization": "Bearer token-a" },
++      body: "{",
++    });
++
++    expect(response.status).toBe(400);
++    expect((await response.json()).error.code).toBe(-32700);
++  });
++
++  it("after close(), answers on a connection still open with Connection: close, so shutdown can finish", async () => {
++    const closing = createHttpServer({ organization: "test-org", enabledDomains: new Set([Domain.SEARCH]) });
++    await new Promise<void>((resolve) => closing.listen(0, "127.0.0.1", resolve));
++    const url = `http://127.0.0.1:${(closing.address() as AddressInfo).port}/mcp`;
++    const agent = new Agent({ keepAlive: true, maxSockets: 1 });
++    const ping = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" });
++
++    // The first request is still in flight when close() is called, so its connection stays open.
++    let finishFirst = () => {};
++    const first = postRaw(
++      url,
++      {},
++      (req) => {
++        req.write(ping.slice(0, 5));
++        finishFirst = () => req.end(ping.slice(5));
++      },
++      agent
++    );
++    await new Promise((resolve) => setTimeout(resolve, 50));
++    const closed = new Promise((resolve) => closing.close(resolve));
++    finishFirst();
++    const second = await first.then(() => postRaw(url, {}, (req) => req.end(ping), agent));
++
++    expect((await first).connection).toBe("keep-alive");
++    expect(second.status).toBe(200);
++    expect(second.connection).toBe("close");
++    await closed;
++    agent.destroy();
 +  });
 +});
 diff --git a/test/src/tools/repositories.test.ts b/test/src/tools/repositories.test.ts
