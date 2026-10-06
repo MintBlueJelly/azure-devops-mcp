@@ -32,38 +32,46 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Both outputs are computed once and reused, so nothing downstream rebuilds the reference by
-      # hand. GHCR requires a lowercase repository path, and `github.repository` preserves the
-      # owner's casing — metadata-action lowercases it silently, so an image reference assembled
-      # anywhere else has to do the same or it will not match.
-      #
-      # The version is the dockerfile's upstream pin plus a revision: one more than the highest
-      # release of that pin so far, starting at 1. Every image pushed gets a tag of its own, so no
-      # tag ever changes what it contains — a rebuild for a base-image CVE included. Nothing is pushed
-      # or released before the smoke test passes, so a failed run's revision is used again by the
-      # next one.
-      - name: Resolve image name and version
-        id: img
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-          arg() { sed -n "s|^ARG $1=\(.*\)$|\1|p" azure-devops-mcp.dockerfile; }
-          tag=$(arg UPSTREAM_TAG); commit=$(arg UPSTREAM_COMMIT)
-          [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)*$ && "$commit" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "UPSTREAM_TAG or UPSTREAM_COMMIT missing or malformed in the dockerfile" >&2; exit 1; }
-          last=$(gh release list --limit 1000 --json tagName \
-            --jq "[.[].tagName | select(startswith(\"$tag-\")) | ltrimstr(\"$tag-\") | select(test(\"^[0-9]+\$\")) | tonumber] | max // 0")
-          echo "version=${tag#v}-$((last + 1))" >> "$GITHUB_OUTPUT"
-          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "upstream_commit=$commit" >> "$GITHUB_OUTPUT"
-
+      # Before the version is resolved, which looks up existing image tags.
       - name: Log in to ghcr.io
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Both outputs are computed once and reused, so nothing downstream rebuilds the reference by
+      # hand. GHCR requires a lowercase repository path, and `github.repository` preserves the
+      # owner's casing — metadata-action lowercases it silently, so an image reference assembled
+      # anywhere else has to do the same or it will not match.
+      #
+      # The version is the dockerfile's upstream pin plus a revision: one more than the highest
+      # release of that pin so far, starting at 1, and past any revision whose image is already in
+      # the registry. Every image pushed gets a tag of its own, so no tag ever changes what it
+      # contains — a rebuild for a base-image CVE included. Nothing is pushed or released before the
+      # smoke test passes, so a failed run's revision is used again by the next one.
+      - name: Resolve image name and version
+        id: img
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          name="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          arg() { sed -n "s|^ARG $1=\(.*\)$|\1|p" azure-devops-mcp.dockerfile; }
+          tag=$(arg UPSTREAM_TAG); commit=$(arg UPSTREAM_COMMIT)
+          [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)*$ && "$commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "UPSTREAM_TAG or UPSTREAM_COMMIT missing or malformed in the dockerfile" >&2; exit 1; }
+          last=$(gh release list --limit 1000 --json tagName \
+            --jq "[.[].tagName | select(startswith(\"$tag-\")) | ltrimstr(\"$tag-\") | select(test(\"^[0-9]+\$\")) | tonumber] | max // 0")
+          revision=$((last + 1))
+          # A run that pushed and then failed to create its release left an image with no release.
+          # Skip its revision rather than overwrite that tag.
+          while docker manifest inspect "$name:${tag#v}-$revision" >/dev/null 2>&1; do
+            revision=$((revision + 1))
+          done
+          echo "version=${tag#v}-$revision" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_commit=$commit" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
         id: meta

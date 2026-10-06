@@ -73,8 +73,9 @@ nothing changed.
 
 Nothing is pushed until the smoke test has passed against the image just built, and the release
 follows the push. The releases are what the next run counts from, so a run that fails publishes
-nothing and its revision is used again by the next run. Runs never overlap, so two of them cannot
-count the same revision.
+nothing and its revision is used again by the next run. A run that pushed but could not create its
+release leaves an image without one, and the next run skips that revision rather than overwrite its
+tag. Runs never overlap, so two of them cannot count the same revision.
 
 The build fails if `UPSTREAM_TAG` no longer points at `UPSTREAM_COMMIT`, if a patch does not apply,
 or if upstream's test suite fails against the patched source. That suite runs in the dockerfile's
