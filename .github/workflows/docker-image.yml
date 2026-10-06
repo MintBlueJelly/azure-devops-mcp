@@ -104,7 +104,9 @@ jobs:
         run: |
           docker run -d --name smoke -p 8080:8080 ${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }} smoke-test-org
           trap 'code=$?; [ $code -ne 0 ] && docker logs smoke; docker rm -f smoke >/dev/null; exit $code' EXIT
-          curl -sf -o /dev/null --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/healthz
+          # Until the server listens, Docker's port proxy accepts a connection and then resets it, which
+          # --retry-connrefused does not retry.
+          curl -sf -o /dev/null --retry 15 --retry-all-errors --retry-delay 1 http://127.0.0.1:8080/healthz
           mcp() { curl -s -X POST http://127.0.0.1:8080/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$@"; }
           anonymous=$(mcp -o /dev/null -w '%{http_code}')
           [ "$anonymous" = 401 ] || { echo "a request without a bearer token got $anonymous, not 401" >&2; exit 1; }
